@@ -1,0 +1,36 @@
+# Environment & secrets
+.env
+.env.*
+!.env.example
+infra/.env
+infra/.env.*
+!infra/.env.example
+
+# Docker
+infra/data/
+infra/volumes/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# n8n exports with credentials (if stored locally)
+workflows/*.json
+!workflows/.gitkeep
+
+# Temp / backups
+tmp/
+*.bak
+*.tmp
+
+# Documentation — on GitHub only root README.md
+*.md
+!/README.md
