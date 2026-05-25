@@ -1,46 +1,52 @@
-# Sales Flow Intelligence — ТД ТМК
+# Sales Flow Intelligence
 
-> **Post-recording intelligence layer** для розничных продаж.  
-> Запись диалога (камера / микрофон) — **вне scope**. Наша система начинается с **транскрипции аудио** и заканчивается **дашбордом, Kaizen и AI-тренировкой**.
+**Post-recording intelligence layer** для розничных продаж: от транскрипции диалога до управленческой аналитики, AI-тренировки и накопления опыта сотрудников.
 
----
-
-## Для кого этот репозиторий
-
-Документация для **senior AI-интегратора**: архитектура, контракты данных, безопасность, отказоустойчивость и **пошаговая сборка в n8n**.
-
-**Код здесь не пишется.** Реализация — workflow-ноды в n8n, которые вы собираете по этой спецификации.
+Запись аудио на точке продаж выполняется upstream-системой и **не входит в scope** данного модуля. Здесь — оркестрация анализа, уведомлений, human-in-the-loop тренировки и отчётности.
 
 ---
 
-## Бизнес-поток (10 шагов)
+## Возможности
 
-| # | Шаг | Ответственность | Где в n8n |
-|---|-----|-----------------|-----------|
-| 0 | Запись диалога (аудио) | Upstream / камера | — |
-| 1 | Транскрипция | **Мы** | WF-01 Ingest |
-| 2 | AI Sales Analyzer | **Мы** | WF-02 Analyze |
-| 3 | JSON: KPI, ошибки, сигналы | **Мы** | WF-02 Analyze |
-| 4 | Короткий разбор сотруднику | **Мы** | WF-03 Notify Employee |
-| 5 | Управленческое предложение регионалу | **Мы** | WF-04 Notify Regional |
-| 6 | «Подтвердить тренировку» | **Мы** | WF-05 Training Gate |
-| 7 | AI-наставник в Telegram | **Мы** | WF-06 Coach |
-| 8 | Результат → AI Memory | **Мы** | WF-06 + WF-07 Memory |
-| 9 | Повторы → Daily / Weekly Kaizen | **Мы** | WF-08 Kaizen (cron) |
-| 10 | Дашборд | **Мы** | WF-09 Dashboard feed |
+| Область | Описание |
+|---------|----------|
+| **Ingest & STT** | Приём события о диалоге, транскрипция, сохранение в PostgreSQL |
+| **AI Sales Analyzer** | Structured output: KPI, ошибки, сигналы клиента, рекомендации |
+| **Уведомления** | Краткий разбор сотруднику и управленческое предложение регионалу (Telegram) |
+| **Training Gate** | Подтверждение тренировки регионалом перед запуском наставника |
+| **AI Coach** | Диалог в Telegram: разбор ошибки, ролевая отработка, фиксация результата |
+| **Employee Memory** | Структурированная память по повторяющимся ошибкам (`employee_id` + `error_code`) |
+| **Kaizen** | Периодические отчёты по частоте ошибок и повторным паттернам |
+| **Dashboard** | Read-only витрина метрик поверх PostgreSQL (Metabase) |
 
 ---
 
-## Архитектурный принцип
+## Бизнес-поток
+
+| # | Этап | Workflow |
+|---|------|----------|
+| 1 | Транскрипция и сохранение диалога | WF-01 Ingest |
+| 2 | AI-анализ продажи | WF-02 Analyze |
+| 3 | Уведомление сотруднику | WF-03 Notify Employee |
+| 4 | Предложение тренировки регионалу | WF-04 Notify Regional |
+| 5 | Подтверждение тренировки | WF-05 Training Gate |
+| 6 | AI-наставник в Telegram | WF-06 Coach |
+| 7 | Запись результата в память | WF-07 Memory Write |
+| 8 | Kaizen-отчёты (cron) | WF-08 Kaizen |
+| 9 | Питание дашборда | WF-09 Dashboard Feed |
+
+---
+
+## Архитектура
 
 ```mermaid
 flowchart TB
-    subgraph upstream [Upstream — не наш scope]
+    subgraph upstream [Upstream]
         REC[Audio Recording Service]
     end
 
-    subgraph n8n [n8n — оркестрация]
-        ING[WF-01 Ingest & Transcribe]
+    subgraph n8n [n8n Orchestration]
+        ING[WF-01 Ingest]
         AN[WF-02 Analyze]
         NE[WF-03 Employee Notify]
         NR[WF-04 Regional Notify]
@@ -51,12 +57,12 @@ flowchart TB
         DS[WF-09 Dashboard Feed]
     end
 
-    subgraph external [Внешние сервисы]
+    subgraph external [External Services]
         STT[STT API]
         LLM[LLM API]
-        DB[(PostgreSQL / Supabase)]
+        DB[(PostgreSQL)]
         TGAPI[Telegram Bot API]
-        DASH[Metabase / Grafana / Sheets]
+        DASH[Metabase]
     end
 
     REC -->|webhook + audio_url| ING
@@ -80,164 +86,148 @@ flowchart TB
     CO --> TGAPI
 ```
 
+### Принципы
+
+- **Event-driven** — связь между этапами через PostgreSQL и internal webhooks (`dialog_id`, `session_id`).
+- **Idempotency** — повторное событие не создаёт дубль анализа.
+- **Single responsibility** — один workflow, одна зона ответственности.
+- **Human-in-the-loop** — тренировка запускается только после подтверждения регионалом.
+- **Structured AI output** — Analyzer и Coach работают с JSON-схемами, не с произвольным текстом.
+- **Observability** — статусы диалога, dead letters, retry на каждом критичном шаге.
+
 ### Разделение слоёв
 
-| Слой | Что делает | Чего не делает |
-|------|------------|----------------|
-| **Ingestion** | Принимает событие, валидирует, ставит в очередь, вызывает STT | Не анализирует продажу |
-| **Analysis** | LLM + JSON Schema, сохраняет `analysis_result` | Не шлёт Telegram |
-| **Notification** | Форматирует короткие сообщения, отправляет | Не принимает решение о тренировке |
-| **Training Gate** | Ждёт подтверждения регионала, создаёт `training_session` | Не ведёт диалог наставника |
-| **Coach** | Stateful диалог в Telegram, фиксирует outcome | Не пересчитывает KPI |
-| **Memory & Kaizen** | Агрегация, частота ошибок, отчёты | Не транскрибирует |
-| **Dashboard** | Read-only витрина из БД | Не пишет бизнес-логику |
-
-**Правило:** один workflow — одна ответственность. Связь только через **БД + webhook + стабильные JSON-контракты**.
+| Слой | Ответственность |
+|------|-----------------|
+| Ingestion | Валидация, STT, запись транскрипта |
+| Analysis | LLM-анализ, KPI и ошибки в `analysis_results` |
+| Notification | Форматирование и доставка сообщений |
+| Training Gate | Ожидание решения регионала, создание `training_session` |
+| Coach | Stateful диалог, outcome сессии |
+| Memory & Kaizen | Агрегация ошибок, отчёты, эскалация повторов |
+| Dashboard | Read-only представление данных |
 
 ---
 
-## Структура документации
+## Стек
 
-| Файл | Содержание |
-|------|------------|
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Слои, статусы, idempotency, обработка потерь |
-| [docs/N8N_WORKFLOWS.md](docs/N8N_WORKFLOWS.md) | **Главный гайд:** какие ноды, в каком порядке, что настраивать |
-| [docs/CONTRACTS.md](docs/CONTRACTS.md) | JSON-схемы, поля БД, webhook payloads |
-| [docs/PROMPTS.md](docs/PROMPTS.md) | Промпты для Analyzer и Coach (без скрипта ТМК + TODO) |
-| [docs/RAG_ROADMAP.md](docs/RAG_ROADMAP.md) | **TODO:** RAG после появления KB ТМК (не MVP, но плюс к архитектуре) |
-| [docs/PRODUCTION_EVOLUTION.md](docs/PRODUCTION_EVOLUTION.md) | n8n pilot → **Python** production (не Java) |
-| [docs/SECURITY.md](docs/SECURITY.md) | Секреты, PII, retention, audit |
-| [infra/README.md](infra/README.md) | Docker, PostgreSQL, n8n — локальный стенд |
-| [docs/PILOT_PROGRESS.md](docs/PILOT_PROGRESS.md) | **Статус пилота:** что собрано в n8n, learnings |
-| [docs/N8N_LLM_OLLAMA.md](docs/N8N_LLM_OLLAMA.md) | WF-02 LLM через Ollama + HTTP patterns |
+| Компонент | Рекомендация |
+|-----------|--------------|
+| Оркестрация | n8n (self-hosted) |
+| База данных | PostgreSQL (JSONB, views, structured memory) |
+| STT | OpenAI Whisper / Yandex SpeechKit |
+| LLM | GPT-4o / Claude (structured output + coach) |
+| Telegram | Bot API (inline-кнопки, диалог наставника) |
+| Дашборд | Metabase |
+| LLM (dev) | Ollama — опционально для локальной разработки |
 
 ---
 
-## Статус пилота (2026-05-24)
+## Структура репозитория
 
-| WF | Статус |
-|----|--------|
-| WF-01 … WF-09 | ✅ **пилот завершён** (9/9) |
+```
+sales_flow_test/
+├── infra/                  # Docker Compose, PostgreSQL init, Makefile
+│   ├── docker-compose.yml
+│   ├── postgres/init/      # Схема БД и seed
+│   └── .env.example
+├── scripts/
+│   ├── demo.sh             # Локальная оркестрация webhook-цепочки
+│   └── ensure-telegram.sh
+└── workflows/              # Экспорт n8n (не коммитится по умолчанию)
+```
 
-Детали: [docs/PILOT_PROGRESS.md](docs/PILOT_PROGRESS.md)
-
-Подробности, тестовый `dialog_id`, ngrok, типичные ошибки n8n: [docs/PILOT_PROGRESS.md](docs/PILOT_PROGRESS.md).
+Реализация бизнес-логики — **n8n workflows** (9 WF), собираемые поверх схемы PostgreSQL и контрактов webhook.
 
 ---
 
-## Локальный стенд (Docker)
+## Быстрый старт
+
+### 1. Инфраструктура
 
 ```bash
 cd infra
-cp .env.example .env   # смените пароли
+cp .env.example .env   # пароли, WEBHOOK_URL, Telegram
 make up
 ```
 
-- **n8n:** http://localhost:5678  
-- **PostgreSQL:** `localhost:5432`, database `sales_flow`  
-- Схема БД поднимается автоматически из `infra/postgres/init/`
+Сервисы:
 
-Подробно: [infra/README.md](infra/README.md)
+| Сервис | URL |
+|--------|-----|
+| n8n | http://localhost:5678 |
+| PostgreSQL | `localhost:5432`, БД `sales_flow` |
+| Metabase (optional) | `make dashboard` → http://localhost:3000 |
+| Ollama (optional) | http://localhost:11434 |
 
----
+Схема БД применяется автоматически из `infra/postgres/init/`.
 
-## Стек (рекомендация для теста)
+### 2. Конфигурация
 
-| Компонент | Рекомендация | Почему |
-|-----------|--------------|--------|
-| Оркестрация | **n8n** (self-hosted или cloud) | Явное ТЗ: сборка нодами |
-| STT | OpenAI Whisper API / Yandex SpeechKit | RU retail, шум — TODO tuning |
-| LLM | GPT-4o / Claude 3.5 | Structured output + диалог coach (**обязательно**) |
-| RAG | — | **Не в MVP** → см. [RAG_ROADMAP.md](docs/RAG_ROADMAP.md) |
-| БД | **PostgreSQL** (Supabase) | Транзакции, JSONB, structured AI memory |
-| Очередь / retry | n8n Error Workflow + таблица `job_queue` | Контроль потерь |
-| Telegram | Bot API через n8n Telegram node | Inline-кнопки для регионала |
-| Дашборд | Metabase поверх PostgreSQL | Быстро, без кода |
+В `infra/.env` задайте:
 
----
+- `POSTGRES_PASSWORD`, `N8N_BASIC_AUTH_*`, `N8N_ENCRYPTION_KEY`
+- `WEBHOOK_URL` — публичный HTTPS URL для Telegram webhooks (tunnel в dev)
+- `TELEGRAM_BOT_TOKEN`, `N8N_TG_WEBHOOK_ID`, `N8N_TG_WEBHOOK_SECRET`
+- `SEED_*_TELEGRAM_CHAT_ID` — chat ID для seed-данных
 
-## Ключевые решения (почему нас выделят)
+Credentials для STT/LLM настраиваются в n8n.
 
-1. **Чёткая граница scope** — не смешиваем камеру и AI-анализ.
-2. **Event-driven + idempotency** — повтор webhook не создаёт дубль анализа.
-3. **Structured output** — Analyzer возвращает JSON по схеме, не «простыню текста».
-4. **Human-in-the-loop** — тренировка только после кнопки регионала.
-5. **Observability** — каждый шаг пишет `status`, `error_code`, `retry_count`.
-6. **Graceful degradation** — STT упал → job в retry; LLM упал → dead letter + алерт.
-7. **TODO явно** — diarization, скрипт ТМК, RAG, legal — не притворяемся, что сделано.
-8. **LLM без RAG в MVP** — осознанно: KB ТМК нет; roadmap RAG задокументирован как production plus.
-9. **n8n — pilot, Python — production** — industrial path на FastAPI/workers, не Java; см. [PRODUCTION_EVOLUTION.md](docs/PRODUCTION_EVOLUTION.md).
+### 3. n8n workflows
 
----
+1. Импортировать или собрать WF-01 … WF-09 в n8n.
+2. Привязать PostgreSQL и Telegram credentials.
+3. Настроить Error Workflow (dead letters + алерт).
+4. Активировать workflows и проверить цепочку ingest → analyze → notify → coach → memory.
 
-## n8n сейчас, Python в production
+### 4. Операции
 
-| | Сейчас (тест / пилот) | Production (наша команда) |
-|---|------------------------|---------------------------|
-| Оркестрация | **n8n** | **FastAPI + Celery/ARQ** |
-| БД и контракты | PostgreSQL, JSON schema | **Те же** — миграция без перепроектирования |
-| Язык | low-code | **Python** (LLM, Telegram, RAG) |
-
-Критика «n8n в проде — проблема» **справедлива для scale**. Мы это фиксируем и показываем **план эволюции на Python**, не на Java/Spring.
-
-Подробно: [docs/PRODUCTION_EVOLUTION.md](docs/PRODUCTION_EVOLUTION.md)
+```bash
+make ps          # статус контейнеров
+make logs        # логи
+make shell-db    # psql в sales_flow
+make restart     # перезапуск + перерегистрация Telegram webhook
+make down        # остановка
+```
 
 ---
 
-## LLM и RAG — решение для тестового
+## Модель данных (ключевые сущности)
 
-| | MVP (тест) | Production plus |
-|---|------------|-----------------|
-| **LLM** | ✅ Analyzer + Coach | То же + repair prompts |
-| **SQL memory** | ✅ `employee_memory` | + retention policy |
-| **RAG** | ❌ Не делаем | ✅ Скрипт ТМК, каталог, best practices → pgvector |
-
-**LLM — ядро.** **RAG — следующий этап**, когда появятся корпоративные документы. Подробно: [docs/RAG_ROADMAP.md](docs/RAG_ROADMAP.md).
-
----
-
-## Быстрый старт (ваши действия в n8n)
-
-1. Прочитать [docs/N8N_WORKFLOWS.md](docs/N8N_WORKFLOWS.md) — там порядок сборки WF-01 → WF-09.
-2. Поднять PostgreSQL и создать таблицы по [docs/CONTRACTS.md](docs/CONTRACTS.md).
-3. Создать Telegram-бота, положить token в n8n Credentials.
-4. Собрать WF-01 с **тестовым** audio URL (симуляция upstream).
-5. Подключить WF-02 с промптом из [docs/PROMPTS.md](docs/PROMPTS.md).
-6. Довести цепочку до Telegram и кнопки «Подтвердить тренировку».
-7. Cron WF-08 + read-only дашборд.
+| Таблица | Назначение |
+|---------|------------|
+| `dialogs` | Диалог, статус pipeline (`ingested` → `coaching_done`) |
+| `analysis_results` | JSON-результат Analyzer |
+| `pending_training_actions` | Токен inline-кнопки для регионала |
+| `training_sessions` | Состояние сессии Coach (`intro`, `roleplay`, `done`) |
+| `employee_memory` | Память по ошибкам: `occurrence_count`, `coaching_notes` |
+| `kaizen_reports` | Сгенерированные отчёты |
+| `dead_letters` | Ошибки pipeline для разбора |
 
 ---
 
-## Scope пилота
+## Безопасность и compliance
 
-- **1 магазин** (`store_001`)
-- Несколько сотрудников (`employee_id`)
-- Синтетические / тестовые аудио на демо
-- Generic rubric продаж (скрипт ТМК — TODO)
-
----
-
-## Legal disclaimer (для README сдачи)
-
-> Аудиозапись выполняется upstream-системой магазина. Данный модуль обрабатывает уже полученные записи. Production rollout требует согласования с юристами (152-ФЗ, уведомление о записи, retention). Анонимизация имён не отменяет требований к обработке биометрии/голоса — см. [docs/SECURITY.md](docs/SECURITY.md).
+- Секреты — только в `.env` и n8n Credentials; `.env` не коммитится.
+- Обработка аудио и персональных данных требует согласования с юристами (152-ФЗ, уведомление о записи, retention).
+- Рекомендуется политика хранения для транскриптов, памяти сотрудников и логов.
+- Internal webhooks — защита через secret token и Basic Auth на n8n UI.
 
 ---
 
-## Чеклист сдачи тестового
+## Эволюция в production
 
-- [x] WF-01 принимает webhook, сохраняет `transcript` (пилот: stub / test ingest)
-- [x] WF-02 возвращает JSON в `analysis_results` (Ollama `llama3.2:1b`, MVP quality)
-- [x] Сотрудник получает короткий разбор в Telegram (WF-03, HTTP → Telegram API)
-- [x] Регионал получает предложение + inline-кнопки (WF-04)
-- [x] Callback «Подтвердить / Не сейчас» → `training_approved` / `training_skipped` (WF-05 + ngrok)
-- [x] Coach запускается только после confirm (WF-06)
-- [x] Memory обновляется после тренировки (WF-07)
-- [x] Kaizen cron агрегирует top errors за 7 дней (WF-08)
-- [x] Дашборд показывает: диалоги, ошибки, тренировки (WF-09 / `v_dashboard_summary`)
-- [ ] Error workflow + retry задокументированы
-- [ ] TODO: diarization, TMK script, production STT, RAG (roadmap описан)
-- [ ] TODO: Python production path (см. PRODUCTION_EVOLUTION.md)
+| Слой | Текущая реализация | Production |
+|------|-------------------|------------|
+| Оркестрация | n8n | FastAPI + Celery/ARQ |
+| Контракты БД | PostgreSQL, JSON schema | Без изменений |
+| LLM / Telegram | n8n nodes | Python-сервисы |
+| RAG (скрипт продаж, KB) | Roadmap | pgvector + корпоративные документы |
+
+n8n используется как **integration layer на этапе внедрения**; целевая industrial-архитектура — Python-сервисы поверх той же схемы данных.
 
 ---
 
-*Документ подготовлен как спецификация интеграции. Реализация — n8n workflows по приложенным гайдам.*
+## Лицензия и статус
+
+Проект находится в стадии **пилотной интеграции**. Production rollout требует hardening STT, diarization, корпоративного rubric и юридического согласования.
