@@ -1,0 +1,223 @@
+{
+  "name": "WF-04: Notify Regional",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "notify-regional",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "de4c8381-934c-4bd2-a44b-e6d5a855c8ff",
+      "name": "Webhook",
+      "webhookId": "d5fb03ac-0fea-4b16-9c30-078c1da242f4"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://api.telegram.org/bot' + $env.TELEGRAM_BOT_TOKEN + '/sendMessage' }}",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify($json.telegram_body) }}\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        640,
+        0
+      ],
+      "id": "1417ab64-0600-4b6a-b4c6-642539b55e97",
+      "name": "HTTP Request"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  d.dialog_id,\n  d.store_id,\n  d.employee_id,\n  d.status,\n  e.full_name AS employee_name,\n  r.full_name AS regional_name,\n  r.telegram_chat_id AS regional_chat_id,\n  ar.result,\n  COALESCE(n.id::text, '') AS notification_id\nFROM dialogs d\nJOIN analysis_results ar ON ar.dialog_id = d.dialog_id\nJOIN employees e ON e.employee_id = d.employee_id\nJOIN regionals r ON r.regional_id = e.regional_id\nLEFT JOIN notifications n\n  ON n.dialog_id = d.dialog_id AND n.recipient_type = 'regional'\nWHERE d.dialog_id = '{{ $json.body.dialog_id }}'::uuid\n  AND d.status IN ('analyzed', 'notified_employee');",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        208,
+        0
+      ],
+      "id": "f7abe749-ffb8-44ab-a621-b9068eb42414",
+      "name": "PG GET",
+      "credentials": {
+        "postgres": {
+          "id": "__POSTGRES_CRED_ID__",
+          "name": "Sales Flow Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const row = $input.first().json;\nconst r = typeof row.result === 'string' ? JSON.parse(row.result) : row.result;\nconst action_token = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {\n  const r = (Math.random() * 16) | 0;\n  const v = c === 'x' ? r : (r & 0x3) | 0x8;\n  return v.toString(16);\n});\n\nconst topError = r.errors?.[0]?.code || '—';\nconst text = `📊 Предложение по диалогу #${String(row.dialog_id).slice(0, 8)}\n\nСотрудник: ${row.employee_name} (${row.employee_id})\nМагазин: ${row.store_id}\n\n${r.manager_summary || 'Требуется разбор диалога.'}\n\n⚠️ Ошибки: ${topError}\n💡 Тренировка: ${(r.recommended_training || '').replace(/_/g, ' ')}\n\nПодтвердите тренировку:`;\n\nreturn [{\n  json: {\n    dialog_id: row.dialog_id,\n    action_token,\n    regional_chat_id: String(row.regional_chat_id).trim(),\n    telegram_body: {\n      chat_id: Number(row.regional_chat_id),\n      text,\n      reply_markup: {\n        inline_keyboard: [[\n          { text: '✅ Подтвердить тренировку', callback_data: `train:${action_token}` },\n          { text: '❌ Не сейчас', callback_data: `skip:${action_token}` },\n        ]],\n      },\n    },\n  },\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        416,
+        0
+      ],
+      "id": "a4279a0b-4725-4a40-8cd0-8ef55a6db786",
+      "name": "CODE"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO notifications (dialog_id, recipient_type, telegram_message_id)\nVALUES (\n  '{{ $('CODE').item.json.dialog_id }}'::uuid,\n  'regional',\n  '{{ $('HTTP Request').first().json.result.message_id }}'\n\n);",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1072,
+        0
+      ],
+      "id": "cf936a3d-d4cc-4c7b-b889-08a61bc08bc7",
+      "name": "Insert Notification",
+      "credentials": {
+        "postgres": {
+          "id": "__POSTGRES_CRED_ID__",
+          "name": "Sales Flow Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE dialogs\nSET status = 'awaiting_training_confirm', updated_at = NOW()\nWHERE dialog_id = '{{ $('CODE').item.json.dialog_id }}'::uuid\nRETURNING dialog_id, status;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1280,
+        0
+      ],
+      "id": "a536f6e4-4d38-4b13-ac64-3c141a050b13",
+      "name": "Update status",
+      "credentials": {
+        "postgres": {
+          "id": "__POSTGRES_CRED_ID__",
+          "name": "Sales Flow Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO pending_training_actions (action_token, dialog_id)\nVALUES (\n  '{{ $('CODE').first().json.action_token }}'::uuid,\n'{{ $('CODE').first().json.dialog_id }}'::uuid\n)\nRETURNING action_token, dialog_id;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        864,
+        0
+      ],
+      "id": "686a58e5-2be6-4905-92fd-6ff133b9ff5b",
+      "name": "Insert Pending",
+      "credentials": {
+        "postgres": {
+          "id": "__POSTGRES_CRED_ID__",
+          "name": "Sales Flow Postgres"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "PG GET",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG GET": {
+      "main": [
+        [
+          {
+            "node": "CODE",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "CODE": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request": {
+      "main": [
+        [
+          {
+            "node": "Insert Pending",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Notification": {
+      "main": [
+        [
+          {
+            "node": "Update status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Pending": {
+      "main": [
+        [
+          {
+            "node": "Insert Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timeSavedMode": "fixed",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  },
+  "nodeGroups": [],
+  "tags": [
+    {
+      "name": "sales-flow"
+    }
+  ],
+  "active": false,
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

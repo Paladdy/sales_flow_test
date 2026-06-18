@@ -22,9 +22,12 @@ Thumbs.db
 *.swo
 *~
 
-# n8n exports with credentials (if stored locally)
+# n8n exports with credentials (local drafts — do not commit)
 workflows/*.json
 !workflows/.gitkeep
+!workflows/export/
+!workflows/export/*.json
+workflows/export-real/
 
 # Temp / backups
 tmp/

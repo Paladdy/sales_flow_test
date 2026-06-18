@@ -33,7 +33,7 @@
 | 6 | AI-наставник в Telegram | WF-06 Coach |
 | 7 | Запись результата в память | WF-07 Memory Write |
 | 8 | Kaizen-отчёты (cron) | WF-08 Kaizen |
-| 9 | Питание дашборда | WF-09 Dashboard Feed |
+| 9 | Обновление данных дашборда | WF-09 Dashboard Feed |
 
 ---
 
@@ -133,60 +133,133 @@ sales_flow_test/
 │   └── .env.example
 ├── scripts/
 │   ├── demo.sh             # Локальная оркестрация webhook-цепочки
-│   └── ensure-telegram.sh
-└── workflows/              # Экспорт n8n (не коммитится по умолчанию)
+│   ├── setup-n8n.sh        # Импорт workflows + credentials
+│   └── sanitize-workflows.py  # Очистка экспорта n8n перед коммитом
+└── workflows/export/       # WF-01…WF-09 (без секретов, в git)
 ```
 
-Реализация бизнес-логики — **n8n workflows** (9 WF), собираемые поверх схемы PostgreSQL и контрактов webhook.
+**Workflows в git** — полный набор пилота (WF-01…WF-09), экспортированный из n8n и очищенный от токенов и PII. Импорт: `make setup-n8n`.
 
 ---
 
 ## Быстрый старт
 
-### 1. Инфраструктура
+**Требования:** Docker, Docker Compose, `curl`, Python 3, **Telegram-бот** (свой token).
 
 ```bash
-cd infra
-cp .env.example .env   # пароли, WEBHOOK_URL, Telegram
-make up
+git clone https://github.com/Paladdy/sales_flow_test.git
+cd sales_flow_test/infra
+cp .env.example .env
+# Заполните TELEGRAM_BOT_TOKEN и chat_id (см. ниже)
+make up                       # postgres + n8n + import workflows
+make demo-auto                # полный прогон WF-01→07 через curl
 ```
 
-Сервисы:
+Ожидаемый результат `demo-auto`:
+- диалог `770e8400-…` проходит ingest → analyze → notify → coach → memory;
+- `dialogs.status = coaching_done`;
+- запись в `employee_memory` для `emp_042`.
+
+Проверка:
+
+```bash
+make shell-db
+# SELECT dialog_id, status FROM dialogs;
+# SELECT * FROM employee_memory;
+```
+
+### Сервисы после `make up`
 
 | Сервис | URL |
 |--------|-----|
-| n8n | http://localhost:5678 |
+| n8n | http://localhost:5678 (порт — `N8N_PORT` в `infra/.env`) |
 | PostgreSQL | `localhost:5432`, БД `sales_flow` |
 | Metabase (optional) | `make dashboard` → http://localhost:3000 |
-| Ollama (optional) | http://localhost:11434 |
 
 Схема БД применяется автоматически из `infra/postgres/init/`.
 
-### 2. Конфигурация
+> **n8n 2.x:** в `docker-compose.yml` задано `N8N_BLOCK_ENV_ACCESS_IN_NODE=false` — иначе
+> HTTP-ноды не смогут читать `$env.TELEGRAM_BOT_TOKEN`.
 
-В `infra/.env` задайте:
+### Режимы demo
 
-- `POSTGRES_PASSWORD`, `N8N_BASIC_AUTH_*`, `N8N_ENCRYPTION_KEY`
-- `WEBHOOK_URL` — публичный HTTPS URL для Telegram webhooks (tunnel в dev)
-- `TELEGRAM_BOT_TOKEN`, `N8N_TG_WEBHOOK_ID`, `N8N_TG_WEBHOOK_SECRET`
-- `SEED_*_TELEGRAM_CHAT_ID` — chat ID для seed-данных
+| Режим | Команда | Telegram |
+|-------|---------|----------|
+| **Auto** | `make demo-auto` | Сообщения уходят в чаты из seed; кнопки эмулируются curl |
+| **Manual** | `make demo-manual` | Нужен публичный webhook (ngrok) — кнопки и coach в живом чате |
 
-Credentials для STT/LLM настраиваются в n8n.
+---
 
-### 3. n8n workflows
+## Настройка Telegram
 
-1. Импортировать или собрать WF-01 … WF-09 в n8n.
-2. Привязать PostgreSQL и Telegram credentials.
-3. Настроить Error Workflow (dead letters + алерт).
-4. Активировать workflows и проверить цепочку ingest → analyze → notify → coach → memory.
+> **Токены в репозиторий не попадают.** Каждый разработчик подключает **своего** бота.
 
-### 4. Операции
+### 1. Создайте бота
+
+1. Откройте [@BotFather](https://t.me/BotFather) → `/newbot` → скопируйте **token**.
+2. Узнайте свой `chat_id` (например, через [@userinfobot](https://t.me/userinfobot)).
+
+### 2. Заполните `infra/.env`
+
+```bash
+TELEGRAM_BOT_TOKEN=123456:ABC...          # ваш token
+N8N_TG_WEBHOOK_ID=                        # n8n → WF-06 Coach → Telegram Trigger → Webhook ID
+N8N_TG_WEBHOOK_SECRET=                    # произвольная строка ≥16 символов
+SEED_EMPLOYEE_TELEGRAM_CHAT_ID=123456789  # chat_id сотрудника (emp_042)
+SEED_REGIONAL_TELEGRAM_CHAT_ID=123456789  # chat_id регионала (reg_01)
+```
+
+### 3. Публичный HTTPS URL (для manual demo)
+
+Telegram не шлёт webhook на `localhost`. Поднимите tunnel:
+
+```bash
+ngrok http 5678   # или ваш N8N_PORT
+# WEBHOOK_URL=https://YOUR-SUBDOMAIN.ngrok-free.dev/
+```
+
+Обновите `WEBHOOK_URL` в `infra/.env` и пересоздайте n8n:
+
+```bash
+cd infra
+docker compose up -d --force-recreate n8n
+make setup-n8n
+../scripts/demo.sh ensure-telegram
+```
+
+### 4. Manual demo
+
+```bash
+make demo-manual
+# → в Telegram нажать «Подтвердить тренировку»
+# → ответить боту 2–4 раза
+./scripts/demo.sh wf07
+```
+
+---
+
+## Обновление workflows из n8n
+
+```bash
+# 1. Экспорт из n8n UI → workflows/export-real/*.json (локально, не коммитить)
+# 2. Очистка и переименование:
+python3 scripts/sanitize-workflows.py
+# 3. Импорт в локальный n8n:
+cd infra && make setup-n8n
+```
+
+---
+
+## Операции
 
 ```bash
 make ps          # статус контейнеров
 make logs        # логи
 make shell-db    # psql в sales_flow
-make restart     # перезапуск + перерегистрация Telegram webhook
+make setup-n8n   # переимпорт workflows
+make demo-auto   # автоматический прогон
+make demo-manual # manual (нужен ngrok + webhook)
+make restart     # перезапуск + optional telegram webhook
 make down        # остановка
 ```
 
@@ -224,7 +297,7 @@ make down        # остановка
 | LLM / Telegram | n8n nodes | Python-сервисы |
 | RAG (скрипт продаж, KB) | Roadmap | pgvector + корпоративные документы |
 
-n8n используется как **integration layer на этапе внедрения**; целевая industrial-архитектура — Python-сервисы поверх той же схемы данных.
+n8n используется как **integration layer на этапе внедрения**; целевая промышленная архитектура — Python-сервисы поверх той же схемы данных.
 
 ---
 

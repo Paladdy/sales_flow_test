@@ -1,0 +1,217 @@
+{
+  "name": "WF-07 Memory Write",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "write-memory",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "0d233936-c1b1-4d02-83d7-8d18b5034c3f",
+      "name": "Webhook",
+      "webhookId": "a33cc496-4683-4fbc-b35d-8596bcd93078"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  ts.session_id,\n  ts.dialog_id,\n  ts.employee_id,\n  ts.state,\n  ts.context,\n  ar.result AS analysis\nFROM training_sessions ts\nJOIN analysis_results ar ON ar.dialog_id = ts.dialog_id\nWHERE ts.session_id = '{{ $json.body.session_id }}'::uuid\n  AND ts.dialog_id = '{{ $json.body.dialog_id }}'::uuid;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        208,
+        0
+      ],
+      "id": "2a7bf4d3-bae0-431c-bbef-663f00f50c87",
+      "name": "PG Load Session",
+      "credentials": {
+        "postgres": {
+          "id": "__POSTGRES_CRED_ID__",
+          "name": "Sales Flow Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const row = $input.first().json;\n\nconst context = typeof row.context === 'string'\n  ? JSON.parse(row.context)\n  : (row.context || []);\n\nconst analysis = typeof row.analysis === 'string'\n  ? JSON.parse(row.analysis)\n  : row.analysis;\n\nconst transcript = context\n  .map((m) => `${m.role === 'user' ? 'Сотрудник' : 'Наставник'}: ${m.text}`)\n  .join('\\n');\n\nconst errors = (analysis?.errors || [])\n  .map((e) => `${e.code}: ${e.description}`)\n  .join('; ') || 'нет';\n\nreturn [{\n  json: {\n    session_id: row.session_id,\n    dialog_id: row.dialog_id,\n    employee_id: row.employee_id,\n    session_transcript: transcript,\n    analysis_summary: errors,\n    top_error_code: (analysis?.errors || [])[0]?.code || 'GENERAL',\n    ollama_body: {\n      model: 'llama3.2:1b',\n      stream: false,\n      options: { temperature: 0.2, num_predict: 120 },\n      messages: [\n        {\n          role: 'system',\n          content: 'Сожми итог тренировки в 2–3 bullet points на русском. Фокус: ошибка, прогресс, что повторить на смене.',\n        },\n        {\n          role: 'user',\n          content: `Диалог тренировки:\\n${transcript}\\n\\nИсходный analysis:\\n${errors}`,\n        },\n      ],\n    },\n  },\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        416,
+        0
+      ],
+      "id": "10f60618-b5f5-4700-bccd-482715f23708",
+      "name": "Build Summary"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:11434/api/chat",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.ollama_body }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        624,
+        0
+      ],
+      "id": "c8aad626-2d04-4fed-ad2f-c86c1fe7558d",
+      "name": "Http Ollama"
+    },
+    {
+      "parameters": {
+        "jsCode": "const prev = $('Build Summary').first().json;\nconst raw = $input.first().json?.message?.content || '';\n\nlet summary = raw.trim();\nif (!summary) {\n  summary = `• Отработана ошибка: ${prev.top_error_code}\\n• Тренировка завершена`;\n}\nif (summary.length > 1500) summary = summary.slice(0, 1500) + '…';\n\nreturn [{\n  json: {\n    employee_id: prev.employee_id,\n    dialog_id: prev.dialog_id,\n    error_code: prev.top_error_code,\n    coaching_notes: summary,\n    notes_escaped: summary.replace(/'/g, \"''\"),\n  },\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        832,
+        0
+      ],
+      "id": "61febb3e-9e66-4322-9e14-1967c68c0c09",
+      "name": "Parse Memory"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO employee_memory (\n  employee_id, error_code, occurrence_count, last_training_at, coaching_notes\n)\nVALUES (\n  '{{ $json.employee_id }}',\n  '{{ $json.error_code }}',\n  1,\n  NOW(),\n  '{{ $json.notes_escaped }}'\n)\nON CONFLICT (employee_id, error_code) DO UPDATE SET\n  occurrence_count = employee_memory.occurrence_count + 1,\n  last_training_at = NOW(),\n  coaching_notes = EXCLUDED.coaching_notes;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1040,
+        -96
+      ],
+      "id": "9b0b08ea-9aba-427b-b046-726fc9ab883f",
+      "name": "PG UPSERT Memory",
+      "credentials": {
+        "postgres": {
+          "id": "__POSTGRES_CRED_ID__",
+          "name": "Sales Flow Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE dialogs SET status = 'coaching_done', updated_at = NOW()\nWHERE dialog_id = '{{ $json.dialog_id }}'::uuid;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1056,
+        80
+      ],
+      "id": "2c768f64-726d-4662-91b0-2f17a0624fdd",
+      "name": "PG Update Dialog",
+      "credentials": {
+        "postgres": {
+          "id": "__POSTGRES_CRED_ID__",
+          "name": "Sales Flow Postgres"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "PG Load Session",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG Load Session": {
+      "main": [
+        [
+          {
+            "node": "Build Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Summary": {
+      "main": [
+        [
+          {
+            "node": "Http Ollama",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Http Ollama": {
+      "main": [
+        [
+          {
+            "node": "Parse Memory",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Memory": {
+      "main": [
+        [
+          {
+            "node": "PG UPSERT Memory",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "PG Update Dialog",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG UPSERT Memory": {
+      "main": [
+        []
+      ]
+    },
+    "PG Update Dialog": {
+      "main": [
+        []
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timeSavedMode": "fixed",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  },
+  "nodeGroups": [],
+  "tags": [
+    {
+      "name": "sales-flow"
+    }
+  ],
+  "active": false,
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

@@ -1,0 +1,217 @@
+{
+  "name": "WF-03 Notify Employee",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "notify-employee",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "5e3aae89-2797-4772-9bd4-2955af92914f",
+      "name": "Webhook Notify",
+      "webhookId": "f9803685-fa91-4cd2-800c-b383f76c1585"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  d.dialog_id,\n  d.store_id,\n  d.employee_id,\n  d.status,\n  e.full_name AS employee_name,\n  e.telegram_chat_id,\n  ar.result,\n  n.id AS notification_id\nFROM dialogs d\nJOIN analysis_results ar ON ar.dialog_id = d.dialog_id\nJOIN employees e ON e.employee_id = d.employee_id\nLEFT JOIN notifications n\n  ON n.dialog_id = d.dialog_id AND n.recipient_type = 'employee'\nWHERE d.dialog_id = '{{ $json.body.dialog_id }}'::uuid\n  AND d.status = 'analyzed';",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        208,
+        0
+      ],
+      "id": "a3f34d75-213f-4a9f-811a-8b8e4e5ad2ba",
+      "name": "Execute a SQL query",
+      "credentials": {
+        "postgres": {
+          "id": "__POSTGRES_CRED_ID__",
+          "name": "Sales Flow Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const row = $('Execute a SQL query').first().json;\n\nconst r = typeof row.result === 'string'\n  ? JSON.parse(row.result)\n  : row.result;\n\nconst strengths = (r.strengths || []).slice(0, 2).join(', ') || 'есть сильные моменты';\n\nconst err = r.errors?.[0];\nconst errorText = err\n  ? `${err.description || err.code} (${err.code})`\n  : 'нет критичных ошибок';\n\nconst tip = (r.recommended_training || 'needs_discovery_open_questions')\n  .replace(/_/g, ' ');\n\nconst shortId = String(row.dialog_id).slice(0, 8);\n\nconst telegram_text = `📋 Разбор диалога #${shortId}\n\n✅ Сильные стороны: ${strengths}\n⚠️ Ошибка: ${errorText}\n💡 Совет: ${tip}\n\nПолный отчёт — в системе.`;\n\nreturn [{\n  json: {\n    dialog_id: row.dialog_id,\n    telegram_chat_id: row.telegram_chat_id,\n    employee_name: row.employee_name,\n    telegram_text,\n  },\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        624,
+        -96
+      ],
+      "id": "aef5f454-1d62-40b2-b24a-5da71ff5fc99",
+      "name": "Build Employee Message"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO notifications (dialog_id, recipient_type, telegram_message_id)\nVALUES (\n  '{{ $('Build Employee Message').item.json.dialog_id }}'::uuid,\n  'employee',\n  '{{ $json.result.message_id }}'\n)\nRETURNING id, dialog_id;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1040,
+        -96
+      ],
+      "id": "c6a7b47f-5c3b-4a31-99b9-8cb2a540040d",
+      "name": "PG Insert Notification",
+      "credentials": {
+        "postgres": {
+          "id": "__POSTGRES_CRED_ID__",
+          "name": "Sales Flow Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE dialogs\nSET status = 'notified_employee', updated_at = NOW()\nWHERE dialog_id = '{{ $('Build Employee Message').item.json.dialog_id }}'::uuid\nRETURNING dialog_id, status;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1248,
+        -96
+      ],
+      "id": "80777718-7d37-4c77-91b3-8f40809e7c8d",
+      "name": "Mark Notified",
+      "credentials": {
+        "postgres": {
+          "id": "__POSTGRES_CRED_ID__",
+          "name": "Sales Flow Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\n  \"status\": \"notified\",\n  \"dialog_id\": \"={{ $('Build Employee Message').item.json.dialog_id }}\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1456,
+        -96
+      ],
+      "id": "0b70d38f-6db8-450f-b667-0689f09e19e8",
+      "name": "Respond to Webhook"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://api.telegram.org/bot' + $env.TELEGRAM_BOT_TOKEN + '/sendMessage' }}",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ chat_id: Number($json.telegram_chat_id), text: $json.telegram_text }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        832,
+        -96
+      ],
+      "id": "641a7026-e3ae-4a6d-911a-0dbea19cc449",
+      "name": "HTTP Request"
+    }
+  ],
+  "connections": {
+    "Webhook Notify": {
+      "main": [
+        [
+          {
+            "node": "Execute a SQL query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute a SQL query": {
+      "main": [
+        [
+          {
+            "node": "Build Employee Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Employee Message": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG Insert Notification": {
+      "main": [
+        [
+          {
+            "node": "Mark Notified",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Notified": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request": {
+      "main": [
+        [
+          {
+            "node": "PG Insert Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timeSavedMode": "fixed",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  },
+  "nodeGroups": [],
+  "tags": [
+    {
+      "name": "sales-flow"
+    }
+  ],
+  "active": false,
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

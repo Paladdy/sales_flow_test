@@ -1,0 +1,215 @@
+{
+  "name": "WF-02 Analyze",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "analyze",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "7db4179c-a9c4-480f-9199-8b17439881d9",
+      "name": "Webhook Analyze",
+      "webhookId": "b54f3e9e-166f-41fa-94bb-9e38924dd8ee"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT dialog_id, store_id, employee_id, transcript, status\nFROM dialogs\nWHERE dialog_id = '{{ $json.body.dialog_id }}'::uuid\n  AND status = 'transcribed';",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        208,
+        0
+      ],
+      "id": "f28cf6cc-14d9-490f-9f03-c11ec96369a4",
+      "name": "PG Get Dialog",
+      "credentials": {
+        "postgres": {
+          "id": "__POSTGRES_CRED_ID__",
+          "name": "Sales Flow Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $('PG Get Dialog').first().json;\n\nreturn [{\n  json: {\n    dialog_id: d.dialog_id,\n    ollama_body: {\n      model: 'llama3.2:1b',\n      stream: false,\n      options: {\n        num_predict: 500,\n        temperature: 0,\n        stop: ['\\n\\nПРОДАВЕЦ', '\\nПРОДАВЕЦ:', 'ПОКУПАТЕЛЬ:'],\n      },\n      messages: [\n        {\n          role: 'system',\n          content: 'Output ONLY one JSON object. Copy structure exactly:\\n{\"kpi\":{\"greeting\":true,\"needs_discovery_score\":0.4,\"product_offer\":true,\"product_justification\":false,\"objection_handling\":null,\"upsell_attempt\":false,\"closing_attempt\":false,\"overall_score\":0.5},\"errors\":[{\"code\":\"WEAK_NEEDS_DISCOVERY\",\"severity\":\"high\",\"description\":\"текст\",\"quote\":\"цитата\",\"seller_quote\":null}],\"control_loss\":[],\"trust_loss\":[],\"client_signals\":[],\"strengths\":[],\"recommended_training\":\"needs_discovery_open_questions\",\"manager_summary\":\"кратко\"}',\n        },\n        {\n          role: 'user',\n          content: `Диалог:\\n${d.transcript}`,\n        },\n      ],\n    },\n  },\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        416,
+        0
+      ],
+      "id": "b9286f69-e1b1-4ff2-901a-ff34fd2ccba2",
+      "name": "Build Ollama Body"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:11434/api/chat",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify($json.ollama_body) }}\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        592,
+        0
+      ],
+      "id": "7a75025b-1c9c-498b-be5b-1a7358b5692f",
+      "name": "Ollama Analyze"
+    },
+    {
+      "parameters": {
+        "jsCode": "const dialog = $('PG Get Dialog').first().json;\nlet raw = ($input.first().json.message?.content ?? '')\n  .replace(/<\\|[^|]+\\|>/g, '')\n  .trim();\n\nconst match = raw.match(/\\{[\\s\\S]*\\}/);\nif (!match) {\n  throw new Error('Ollama не вернул JSON. Ответ: ' + raw.slice(0, 300));\n}\n\nlet text = match[0];\nlet result;\n\nwhile (text.length > 0) {\n  try {\n    result = JSON.parse(text);\n    break;\n  } catch (e) {\n    if (text.endsWith('}')) {\n      text = text.slice(0, -1);\n      continue;\n    }\n    throw new Error(`JSON.parse failed: ${e.message}\\n---\\n${match[0].slice(0, 500)}`);\n  }\n}\n\nreturn [{\n  json: {\n    dialog_id: dialog.dialog_id,\n    result,\n    model_version: 'llama3.2:1b',\n  },\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        784,
+        0
+      ],
+      "id": "71e9cc78-77f5-4306-8803-6543d779909e",
+      "name": "Parse Analysis JSON"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO analysis_results (dialog_id, result, model_version)\nVALUES (\n  '{{ $json.dialog_id }}'::uuid,\n  '{{ JSON.stringify($json.result).replace(/'/g, \"''\") }}'::jsonb,\n  '{{ $json.model_version }}'\n)\nRETURNING id, dialog_id;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        992,
+        0
+      ],
+      "id": "56315428-b99d-42bd-adb9-d3d501430642",
+      "name": "PG Insert Analysis",
+      "credentials": {
+        "postgres": {
+          "id": "__POSTGRES_CRED_ID__",
+          "name": "Sales Flow Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE dialogs SET\n  status = 'analyzed',\n  analyzed_at = NOW()\nWHERE dialog_id = '{{ $json.dialog_id }}'::uuid\nRETURNING dialog_id, status;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1184,
+        0
+      ],
+      "id": "96b203e5-6498-46a8-8af3-e145f323b56d",
+      "name": "PG Mark Analyzed",
+      "credentials": {
+        "postgres": {
+          "id": "__POSTGRES_CRED_ID__",
+          "name": "Sales Flow Postgres"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook Analyze": {
+      "main": [
+        [
+          {
+            "node": "PG Get Dialog",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG Get Dialog": {
+      "main": [
+        [
+          {
+            "node": "Build Ollama Body",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Ollama Body": {
+      "main": [
+        [
+          {
+            "node": "Ollama Analyze",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama Analyze": {
+      "main": [
+        [
+          {
+            "node": "Parse Analysis JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Analysis JSON": {
+      "main": [
+        [
+          {
+            "node": "PG Insert Analysis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG Insert Analysis": {
+      "main": [
+        [
+          {
+            "node": "PG Mark Analyzed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timeSavedMode": "fixed",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  },
+  "nodeGroups": [],
+  "tags": [
+    {
+      "name": "sales-flow"
+    }
+  ],
+  "active": false,
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

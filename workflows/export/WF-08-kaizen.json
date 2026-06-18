@@ -1,0 +1,189 @@
+{
+  "name": "WF-08 Kaizen",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * *"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        0,
+        0
+      ],
+      "id": "564f2117-be25-420a-aca2-dd66f4e4b736",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT error_code, SUM(cnt)::int AS total\nFROM v_error_frequency\nWHERE store_id = 'store_001'\n  AND day >= CURRENT_DATE - INTERVAL '7 days'\nGROUP BY error_code\nORDER BY total DESC\nLIMIT 5;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        208,
+        0
+      ],
+      "id": "6ca67096-dfd9-45c2-aed3-89866a95d0d2",
+      "name": "PG Top Errors",
+      "credentials": {
+        "postgres": {
+          "id": "__POSTGRES_CRED_ID__",
+          "name": "Sales Flow Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT employee_id, error_code, SUM(cnt)::int AS total\nFROM v_error_frequency\nWHERE store_id = 'store_001'\n  AND day >= CURRENT_DATE - INTERVAL '7 days'\nGROUP BY employee_id, error_code\nHAVING SUM(cnt) >= 1\nORDER BY total DESC;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        416,
+        0
+      ],
+      "id": "d768544b-dbfe-4380-87fe-ea26282c388a",
+      "name": "PG Employee Repeats",
+      "credentials": {
+        "postgres": {
+          "id": "__POSTGRES_CRED_ID__",
+          "name": "Sales Flow Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const errors = $('PG Top Errors').all().map((i) => i.json);\nconst repeats = $('PG Employee Repeats').all().map((i) => i.json);\n\nconst today = new Date().toISOString().slice(0, 10);\nconst lines = [\n  `📊 Kaizen Daily — store_001 — ${today}`,\n  '',\n  'Top ошибки:',\n];\n\nif (errors.length === 0) {\n  lines.push('• нет данных');\n} else {\n  errors.forEach((e, i) => lines.push(`${i + 1}. ${e.error_code} (${e.total})`));\n}\n\nlines.push('', 'Сотрудники с повторами:');\nif (repeats.length === 0) {\n  lines.push('• нет');\n} else {\n  repeats.forEach((r) => {\n    lines.push(`• ${r.employee_id} — ${r.error_code} x${r.total} за 7 дней → рекомендуется тренировка`);\n  });\n}\n\nconst report_text = lines.join('\\n');\n\nreturn [{\n  json: {\n    store_id: 'store_001',\n    report_type: 'daily',\n    report_date: today,\n    report_text,\n    content_escaped: report_text.replace(/'/g, \"''\"),\n    telegram_body: {\n      chat_id: String($env.SEED_REGIONAL_TELEGRAM_CHAT_ID || '0'),\n      text: report_text,\n    },\n  },\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        624,
+        0
+      ],
+      "id": "6f552f89-c01d-4931-bcd9-f21074ce9972",
+      "name": "Format Report",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://api.telegram.org/bot' + $env.TELEGRAM_BOT_TOKEN + '/sendMessage' }}",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify($json.telegram_body) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        864,
+        -32
+      ],
+      "id": "6c221a37-baf8-4809-a00d-3f3396468035",
+      "name": "Http Telegram Send Message"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO kaizen_reports (store_id, report_type, report_date, content)\nVALUES (\n  '{{ $json.store_id }}',\n  '{{ $json.report_type }}',\n  '{{ $json.report_date }}'::date,\n  '{{ $json.content_escaped }}'\n);",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        880,
+        192
+      ],
+      "id": "ae387028-54a8-4546-aa82-651a6a0600a7",
+      "name": "PG Insert Report",
+      "credentials": {
+        "postgres": {
+          "id": "__POSTGRES_CRED_ID__",
+          "name": "Sales Flow Postgres"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "PG Top Errors",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG Top Errors": {
+      "main": [
+        [
+          {
+            "node": "PG Employee Repeats",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG Employee Repeats": {
+      "main": [
+        [
+          {
+            "node": "Format Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Report": {
+      "main": [
+        [
+          {
+            "node": "Http Telegram Send Message",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "PG Insert Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timeSavedMode": "fixed",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  },
+  "nodeGroups": [],
+  "tags": [
+    {
+      "name": "sales-flow"
+    }
+  ],
+  "active": false,
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

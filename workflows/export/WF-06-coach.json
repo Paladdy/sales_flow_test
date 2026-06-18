@@ -1,0 +1,870 @@
+{
+  "name": "WF-06 Coach",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "start-coach",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -352,
+        -192
+      ],
+      "id": "adfda7d3-2d41-40a6-8351-be2a3fbf7a82",
+      "name": "Webhook",
+      "webhookId": "844ecda4-847b-4592-bab9-e98cc4b7f6ab"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT d.dialog_id, d.status, d.employee_id, ar.result AS analysis,\n       e.telegram_chat_id, e.full_name\nFROM dialogs d\nJOIN analysis_results ar ON ar.dialog_id = d.dialog_id\nJOIN employees e ON e.employee_id = d.employee_id\nWHERE d.dialog_id = '{{ $json.body.dialog_id }}'::uuid\n  AND d.employee_id = '{{ $json.body.employee_id }}'\n  AND d.status = 'training_approved';",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -144,
+        -192
+      ],
+      "id": "db7f4f33-a2f2-4180-a700-b7c1ddbd8561",
+      "name": "PG Load Context",
+      "credentials": {
+        "postgres": {
+          "id": "__POSTGRES_CRED_ID__",
+          "name": "Sales Flow Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const row = $input.first().json;\nconst analysis = typeof row.analysis === 'string' ? JSON.parse(row.analysis) : row.analysis;\nconst top = (analysis?.errors || [])[0] || { code: 'GENERAL', description: 'нет данных' };\n\nfunction uuid() {\n  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {\n    const r = (Math.random() * 16) | 0;\n    return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);\n  });\n}\n\nreturn [{\n  json: {\n    session_id: uuid(),\n    dialog_id: row.dialog_id,\n    employee_id: row.employee_id,\n    telegram_chat_id: String(row.telegram_chat_id).trim(),\n    full_name: row.full_name,\n    session_state: 'intro',\n    user_message: '(старт сессии)',\n    errors_summary: `${top.code}: ${top.description}`,\n    employee_memory: 'нет',\n    analysis,\n    context: [],\n  },\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        32,
+        -192
+      ],
+      "id": "1adcbfef-7141-4538-8343-3264e17edcc8",
+      "name": "Build Start"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO training_sessions (session_id, dialog_id, employee_id, state, context)\nVALUES (\n  '{{ $json.session_id }}'::uuid,\n  '{{ $json.dialog_id }}'::uuid,\n  '{{ $json.employee_id }}',\n  'intro',\n  '[]'::jsonb\n)\nRETURNING session_id, dialog_id, state;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        224,
+        -192
+      ],
+      "id": "766fed9d-2319-4cc3-bbef-e943a8c59545",
+      "name": "PG Insert Session",
+      "credentials": {
+        "postgres": {
+          "id": "__POSTGRES_CRED_ID__",
+          "name": "Sales Flow Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const j = $input.first().json;\n\nconst phaseHint = {\n  intro: 'Кратко объясни ошибку WEAK_NEEDS_DISCOVERY и предложи практику. Спроси: готов начать?',\n  roleplay: 'Ты играешь КЛИЕНТА в магазине колбас. Клиент хочет нежирное, но не знает что. Ответь коротко как покупатель.',\n  feedback: 'Похвали за открытые вопросы, дай 1 совет. Напиши что тренировка завершена.',\n  done: 'Поблагодари и заверши тренировку одним предложением.',\n}[j.session_state] || 'Продолжай тренировку.';\n\nconst system = `Ты AI-наставник по продажам в магазине колбас и мясных изделий. Только русский язык.\n\nФаза: ${j.session_state}\nЗадача: ${phaseHint}\nОшибка из диалога: ${j.errors_summary}\nСотрудник: ${j.full_name || 'продавец'}\n\nПравила:\n- 2–4 предложения, до 350 символов\n- Только русский, без английских слов\n- НЕ выдумывай бренды и названия магазинов\n- НЕ пиши только метку состояния — сначала нормальный текст для человека\n- В самом конце ответа ОТДЕЛЬНОЙ строкой: [STATE:roleplay] или [STATE:feedback] или [STATE:done]\n\nПример хорошего ответа:\n\"Мария, вы сразу предложили товар, не выяснив потребности. Давайте потренируемся: клиент хочет нежирное. Задайте 1–2 открытых вопроса.\"\n[STATE:roleplay]`;\n\nconst history = (j.context || [])\n  .map((m) => `${m.role === 'user' ? 'Сотрудник' : 'Наставник'}: ${m.text}`)\n  .join('\\n');\n\nconst user = `История:\n${history || '(пусто)'}\n\nСообщение сотрудника:\n${j.user_message || '(старт сессии)'}`;\n\nreturn [{\n  json: {\n    ...j,\n    ollama_body: {\n      model: 'llama3.2:1b',\n      stream: false,\n      options: {\n        temperature: 0.2,\n        num_predict: 220,\n      },\n      messages: [\n        { role: 'system', content: system },\n        { role: 'user', content: user },\n      ],\n    },\n  },\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        -192
+      ],
+      "id": "f0f33992-ec1f-4811-b424-e3f05c5ce8ea",
+      "name": "Build Ollama Body"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:11434/api/chat",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify($json.ollama_body) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        864,
+        -192
+      ],
+      "id": "30b7cca1-4215-4259-ab79-d7fca5dce5bc",
+      "name": "Http Ollama"
+    },
+    {
+      "parameters": {
+        "jsCode": "const prev = $('Build Ollama Body').first().json;\nconst ollamaOut = $input.first().json;\n\nconst STATE_MAP = {\n  intro: 'intro', roleplay: 'roleplay', feedback: 'feedback', done: 'done',\n  вступление: 'intro', практика: 'roleplay', практик: 'roleplay',\n  разбор: 'feedback', обратная: 'feedback', готово: 'done', завершено: 'done',\n  вопрос: 'roleplay', question: 'roleplay',\n};\n\nfunction stripStateTags(raw) {\n  let nextState = prev.session_state || 'intro';\n  const tagRe = /\\[(?:STATE|state)\\s*:\\s*([^\\]\\n]+)\\]/gi;\n  const tags = [...raw.matchAll(tagRe)];\n  for (const m of tags) {\n    const token = m[1].trim().toLowerCase();\n    if (STATE_MAP[token]) nextState = STATE_MAP[token];\n  }\n  const text = raw.replace(/\\[(?:STATE|state)\\s*:\\s*[^\\]\\n]+\\]/gi, '').trim();\n  return { text, nextState };\n}\n\nfunction countUserTurns(context) {\n  return (context || []).filter((m) => m.role === 'user').length;\n}\n\nfunction scriptedReply(state, userTurns, userMessage) {\n  const name = prev.full_name || 'коллега';\n  const err = prev.errors_summary || 'WEAK_NEEDS_DISCOVERY';\n  const msg = (userMessage || '').toLowerCase();\n\n  if (state === 'intro' || prev.user_message === '(старт сессии)') {\n    return {\n      text: `Привет, ${name}! Ошибка в диалоге: ${err}. Вы сразу предложили товар, не выяснив потребности. Потренируемся: клиент хочет нежирное, но не определился. Задайте открытые вопросы — для кого покупка и что важнее?`,\n      nextState: 'roleplay',\n    };\n  }\n\n  if (state === 'roleplay') {\n    if (userTurns >= 2 || /докторск|индейк|колбас|нежирн|нарезк/.test(msg)) {\n      return {\n        text: 'Отлично! Вы задали вопросы и предложили варианты — так и нужно. Совет: всегда начинайте с «Для кого выбираете?» и «Что важнее — нежирное или вкус?». Тренировка завершена!',\n        nextState: 'done',\n      };\n    }\n    if (/семь|ужин|нежир|для кого|важнее/.test(msg)) {\n      return {\n        text: 'Для семьи, к ужину. Хочу нежирное — докторская или индейка, не могу выбрать. Что посоветуете?',\n        nextState: 'roleplay',\n      };\n    }\n    return {\n      text: 'Хочу что-то нежирное к ужину, но не знаю что выбрать. Подскажите?',\n      nextState: 'roleplay',\n    };\n  }\n\n  return {\n    text: 'Тренировка завершена. Спасибо!',\n    nextState: 'done',\n  };\n}\n\nfunction isBadReply(text) {\n  if (!text || text.length < 25) return true;\n  if (/\\[(?:STATE|state)\\s*:/i.test(text)) return true;\n  if (/берлос|домиан|продвижени|кто покупает в магазине/i.test(text)) return true;\n  if (/^[\\[\\(]?(?:STATE|state)\\s*:/i.test(text)) return true;\n  return false;\n}\n\nconst raw = (\n  ollamaOut?.message?.content ||\n  ollamaOut?.response ||\n  ''\n).trim();\n\nconst stripped = stripStateTags(raw);\nconst userTurns = countUserTurns(prev.context);\nconst currentState = prev.session_state || 'intro';\n\nlet text = stripped.text;\nlet nextState = stripped.nextState;\n\n// llama3.2:1b ненадёжен — для пилота используем сценарные ответы\nconst scripted = scriptedReply(currentState, userTurns, prev.user_message);\ntext = scripted.text;\nnextState = scripted.nextState;\n\nif (isBadReply(text)) {\n  const fb = scriptedReply(currentState, userTurns, prev.user_message);\n  text = fb.text;\n  nextState = fb.nextState;\n}\n\nif (text.length > 3800) text = text.slice(0, 3800) + '…';\n\nconst chatId = String(prev.telegram_chat_id || String($env.SEED_REGIONAL_TELEGRAM_CHAT_ID || '0')).trim();\nconst context = [...(prev.context || [])];\ncontext.push({ role: 'assistant', text, at: new Date().toISOString() });\n\nreturn [{\n  json: {\n    ...prev,\n    coach_reply: text,\n    session_state: nextState,\n    context,\n    context_json: JSON.stringify(context),\n    telegram_body: { chat_id: chatId, text },\n  },\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1056,
+        -192
+      ],
+      "id": "108888f2-3d51-49ef-b1a7-7ced3bf82870",
+      "name": "Parse Coach"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://api.telegram.org/bot' + $env.TELEGRAM_BOT_TOKEN + '/sendMessage' }}",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify($json.telegram_body) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        1664,
+        -224
+      ],
+      "id": "f52e3090-80f9-4579-b4dd-048432c10e53",
+      "name": "Http Telegram SendMessage"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE training_sessions SET\n  state = '{{ $json.session_state }}',\n  context = '{{ $json.context_json }}'::jsonb\nWHERE session_id = '{{ $json.session_id }}'::uuid;\n\nUPDATE dialogs SET status = 'coaching', updated_at = NOW()\nWHERE dialog_id = '{{ $json.dialog_id }}'::uuid;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1680,
+        -400
+      ],
+      "id": "5460bba3-8012-4c65-9e57-9b52c00d0207",
+      "name": "PG Update",
+      "credentials": {
+        "postgres": {
+          "id": "__POSTGRES_CRED_ID__",
+          "name": "Sales Flow Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const start = $('Build Start').first().json;\nconst pg = $input.first().json;\n\nreturn [{\n  json: {\n    ...start,\n    session_id: pg.session_id || start.session_id,\n    session_state: pg.state || start.session_state,\n  },\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        432,
+        -192
+      ],
+      "id": "9fbf7fe1-6e82-4f09-8863-02340e8d154a",
+      "name": "Code in JavaScript"
+    },
+    {
+      "parameters": {
+        "updates": [
+          "*"
+        ],
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -848,
+        528
+      ],
+      "id": "33261daa-9372-4372-ac18-50018652d669",
+      "name": "Telegram Trigger",
+      "webhookId": "fa5755e9-20be-4581-b0e6-83fe997394a5",
+      "credentials": {
+        "telegramApi": {
+          "id": "__TELEGRAM_CRED_ID__",
+          "name": "Telegram Bot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://api.telegram.org/bot' + $env.TELEGRAM_BOT_TOKEN + '/sendMessage' }}",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ chat_id: $('Parse Message').first().json.chat_id, text: 'Сначала нажмите «Подтвердить тренировку» в сообщении выше.' }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        304,
+        640
+      ],
+      "id": "2b8202f9-3747-446e-b65f-4211e6ae5991",
+      "name": "HTTP Request"
+    },
+    {
+      "parameters": {
+        "jsCode": "const sess = $input.first().json;\nconst msg = $('Parse Message').first().json;\n\nconst analysis = typeof sess.analysis === 'string'\n  ? JSON.parse(sess.analysis)\n  : sess.analysis;\n\nconst context = typeof sess.context === 'string'\n  ? JSON.parse(sess.context)\n  : (sess.context || []);\n\nconst top = (analysis?.errors || [])[0] || { code: 'GENERAL', description: '—' };\n\nreturn [{\n  json: {\n    session_id: sess.session_id,\n    dialog_id: sess.dialog_id,\n    employee_id: sess.employee_id,\n    telegram_chat_id: String(sess.telegram_chat_id).trim(),\n    full_name: sess.full_name,\n    session_state: sess.session_state || 'roleplay',\n    user_message: msg.user_message,\n    errors_summary: `${top.code}: ${top.description}`,\n    employee_memory: '—',\n    analysis,\n    context: [\n      ...context,\n      { role: 'user', text: msg.user_message, at: new Date().toISOString() },\n    ],\n  },\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        304,
+        496
+      ],
+      "id": "b774d9b2-67e7-4234-8862-7739b8360931",
+      "name": "Build Coach Turn"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "bc674139-8e67-471d-aca9-04293f0489f6",
+              "leftValue": "={{ $json.session_id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        32,
+        544
+      ],
+      "id": "6793fd6e-5571-44a4-b53f-89460cbec2c2",
+      "name": "IF SESSION FOUND"
+    },
+    {
+      "parameters": {
+        "jsCode": "const msg = $input.first().json?.message;\nif (!msg?.text || msg.from?.is_bot) return [];\n\nreturn [{\n  json: {\n    chat_id: String(msg.chat.id),\n    user_message: msg.text.trim(),\n  },\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -432,
+        544
+      ],
+      "id": "27bb64e3-d158-4836-ac11-e697eb51e596",
+      "name": "Parse Message"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  ts.session_id,\n  ts.dialog_id,\n  ts.employee_id,\n  ts.state AS session_state,\n  ts.context,\n  e.telegram_chat_id,\n  e.full_name,\n  ar.result AS analysis\nFROM training_sessions ts\nJOIN employees e ON e.employee_id = ts.employee_id\nJOIN analysis_results ar ON ar.dialog_id = ts.dialog_id\nWHERE e.telegram_chat_id = '{{ $json.chat_id }}'\n  AND ts.ended_at IS NULL\n  AND ts.state != 'done'\nORDER BY ts.started_at DESC\nLIMIT 1;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -208,
+        544
+      ],
+      "id": "f4d7896d-909a-4a35-ab17-e6e1481661b6",
+      "name": "PG Find Session",
+      "credentials": {
+        "postgres": {
+          "id": "__POSTGRES_CRED_ID__",
+          "name": "Sales Flow Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "ba1e30f5-1675-41b5-8801-c04d23df8bc6",
+              "leftValue": "={{ $json.session_state === 'done' }}",
+              "rightValue": {},
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1360,
+        -16
+      ],
+      "id": "911c8d7e-dcab-4d1c-834b-d0beef96c305",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.N8N_WEBHOOK_BASE || 'http://localhost:5678/webhook/' }}write-memory",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "{{ JSON.stringify({ session_id: $json.session_id, dialog_id: $json.dialog_id }) }}\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        1664,
+        -32
+      ],
+      "id": "74267d50-bf5c-493d-b731-5fab5984c142",
+      "name": "Http Write Memory"
+    },
+    {
+      "parameters": {
+        "jsCode": "const cb = $input.first().json.callback_query?.data ?? '';\nconst parts = cb.split(':');\nconst action = parts[0] ?? '';\n// WF-04 pilot: train:{action_token} | TZ: train:{dialog_id}:{action_token}\nconst action_token = parts.length >= 3 ? parts[2] : (parts[1] ?? '');\nconst dialog_id = parts.length >= 3 ? parts[1] : null;\n\nreturn [{\n  json: {\n    action,\n    action_token,\n    dialog_id,\n    callback_query_id: $input.first().json.callback_query.id,\n  },\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -432,
+        384
+      ],
+      "id": "5f36085b-6ccd-45e2-8213-552296970c46",
+      "name": "Parse Callback"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT p.action_token, p.dialog_id, d.employee_id, d.status\nFROM pending_training_actions p\nJOIN dialogs d ON d.dialog_id = p.dialog_id\nWHERE p.action_token = '{{ $json.action_token }}'::uuid\n  AND p.used_at IS NULL\n  AND p.expires_at > NOW()\n  AND d.status = 'awaiting_training_confirm';",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -208,
+        384
+      ],
+      "id": "b0f4c090-c771-452b-934c-f8749ca0f9a9",
+      "name": "PG Validate Gate",
+      "credentials": {
+        "postgres": {
+          "id": "__POSTGRES_CRED_ID__",
+          "name": "Sales Flow Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const parse = $('Parse Callback').first().json;\nconst v = $input.first().json;\nreturn [{ json: { ...v, action: parse.action, action_token: parse.action_token, callback_query_id: parse.callback_query_id } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        32,
+        384
+      ],
+      "id": "2dafd84b-87c6-42c0-b007-c3c0a3ea7200",
+      "name": "Merge Gate"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "64b987f4-e0f2-4d58-bd42-54745e86c9e9",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "train",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        288,
+        352
+      ],
+      "id": "487b4a18-67f6-4b72-b1dc-503f022a791d",
+      "name": "IF Gate Train"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE pending_training_actions SET used_at = NOW()\nWHERE action_token = '{{ $('Parse Callback').first().json.action_token }}'::uuid;\nUPDATE dialogs SET status = 'training_approved', updated_at = NOW()\nWHERE dialog_id = '{{ $json.dialog_id }}'::uuid\nRETURNING dialog_id, status, employee_id;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        544,
+        240
+      ],
+      "id": "5a1b3a7d-ebd7-49d7-a088-b620befe34ed",
+      "name": "PG Approve Gate",
+      "credentials": {
+        "postgres": {
+          "id": "__POSTGRES_CRED_ID__",
+          "name": "Sales Flow Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE pending_training_actions SET used_at = NOW()\nWHERE action_token = '{{ $('Parse Callback').first().json.action_token }}'::uuid;\nUPDATE dialogs SET status = 'training_skipped', updated_at = NOW()\nWHERE dialog_id = '{{ $json.dialog_id }}'::uuid\nRETURNING dialog_id, status;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        544,
+        384
+      ],
+      "id": "aab73a36-3d55-460f-a41a-58cc2ff21749",
+      "name": "PG Skip Gate",
+      "credentials": {
+        "postgres": {
+          "id": "__POSTGRES_CRED_ID__",
+          "name": "Sales Flow Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const row = $('PG Approve Gate').first().json;\nreturn [{\n  json: {\n    body: {\n      dialog_id: row.dialog_id,\n      employee_id: row.employee_id,\n    },\n  },\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        976,
+        48
+      ],
+      "id": "2e8631ca-5ccb-4d0e-8de7-25a6e218513a",
+      "name": "Format Coach Start"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://api.telegram.org/bot' + $env.TELEGRAM_BOT_TOKEN + '/answerCallbackQuery' }}",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ callback_query_id: $('Parse Callback').first().json.callback_query_id, text: 'Тренировка запущена' }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        736,
+        240
+      ],
+      "id": "071e66e1-ca70-498b-8e1b-64b890e25fa8",
+      "name": "TG Answer Approve"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://api.telegram.org/bot' + $env.TELEGRAM_BOT_TOKEN + '/answerCallbackQuery' }}",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ callback_query_id: $('Parse Callback').first().json.callback_query_id, text: 'Отложено' }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        736,
+        400
+      ],
+      "id": "cd9b3fd7-e03d-4676-aebc-d45ce5cc8175",
+      "name": "TG Answer Skip"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "route-cb-001",
+              "operator": {
+                "type": "object",
+                "operation": "exists",
+                "singleValue": true
+              },
+              "leftValue": "={{ $json.callback_query }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "b2eb2bdb-85dc-40fd-93b1-09994e7c60a7",
+      "name": "Route TG",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -672,
+        528
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "PG Load Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG Load Context": {
+      "main": [
+        [
+          {
+            "node": "Build Start",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Start": {
+      "main": [
+        [
+          {
+            "node": "PG Insert Session",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG Insert Session": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Ollama Body": {
+      "main": [
+        [
+          {
+            "node": "Http Ollama",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Http Ollama": {
+      "main": [
+        [
+          {
+            "node": "Parse Coach",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Coach": {
+      "main": [
+        [
+          {
+            "node": "PG Update",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Http Telegram SendMessage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Http Telegram SendMessage": {
+      "main": [
+        []
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "Build Ollama Body",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG Update": {
+      "main": [
+        []
+      ]
+    },
+    "Telegram Trigger": {
+      "main": [
+        [
+          {
+            "node": "Route TG",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF SESSION FOUND": {
+      "main": [
+        [
+          {
+            "node": "Build Coach Turn",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Message": {
+      "main": [
+        [
+          {
+            "node": "PG Find Session",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG Find Session": {
+      "main": [
+        [
+          {
+            "node": "IF SESSION FOUND",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Coach Turn": {
+      "main": [
+        [
+          {
+            "node": "Build Ollama Body",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Http Write Memory",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Callback": {
+      "main": [
+        [
+          {
+            "node": "PG Validate Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG Validate Gate": {
+      "main": [
+        [
+          {
+            "node": "Merge Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Gate": {
+      "main": [
+        [
+          {
+            "node": "IF Gate Train",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Gate Train": {
+      "main": [
+        [
+          {
+            "node": "PG Approve Gate",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "PG Skip Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG Approve Gate": {
+      "main": [
+        [
+          {
+            "node": "TG Answer Approve",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Coach Start": {
+      "main": [
+        [
+          {
+            "node": "PG Load Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG Skip Gate": {
+      "main": [
+        [
+          {
+            "node": "TG Answer Skip",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "TG Answer Approve": {
+      "main": [
+        [
+          {
+            "node": "Format Coach Start",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route TG": {
+      "main": [
+        [
+          {
+            "node": "Parse Callback",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Parse Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timeSavedMode": "fixed",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  },
+  "nodeGroups": [],
+  "tags": [
+    {
+      "name": "sales-flow"
+    }
+  ],
+  "active": false,
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

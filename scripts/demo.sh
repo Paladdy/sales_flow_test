@@ -4,7 +4,6 @@
 
 set -euo pipefail
 
-N8N="http://localhost:5678"
 DIALOG="770e8400-e29b-41d4-a716-446655440002"
 EMP="emp_042"
 STORE="store_001"
@@ -13,16 +12,19 @@ if [[ -f "$(dirname "$0")/../infra/.env" ]]; then
   # shellcheck disable=SC1091
   source "$(dirname "$0")/../infra/.env"
 fi
+N8N_PORT="${N8N_PORT:-5678}"
+N8N="http://localhost:${N8N_PORT}"
 # WF-06 Telegram Trigger — задай в infra/.env (не коммитить)
 TG_WEBHOOK_ID="${N8N_TG_WEBHOOK_ID:-}"
 TG_SECRET="${N8N_TG_WEBHOOK_SECRET:-}"
 TG_BOT="${TELEGRAM_BOT_TOKEN:-}"
-WEBHOOK_URL="${WEBHOOK_URL:-http://localhost:5678/}"
+WEBHOOK_URL="${WEBHOOK_URL:-http://localhost:${N8N_PORT}/}"
 WEBHOOK_URL="${WEBHOOK_URL%/}/"
 
 ensure_telegram() {
   if [[ -z "${TG_BOT}" || -z "${TG_WEBHOOK_ID}" || -z "${TG_SECRET}" ]]; then
     echo "!!! Задай TELEGRAM_BOT_TOKEN, N8N_TG_WEBHOOK_ID, N8N_TG_WEBHOOK_SECRET в infra/.env"
+    echo "    Инструкция: README.md → «Настройка Telegram»"
     return 1
   fi
   echo "=== Telegram webhook: message + callback_query ==="
@@ -38,6 +40,14 @@ ensure_telegram() {
     echo "    Проверь: ngrok запущен, WEBHOOK_URL в infra/.env"
     return 1
   fi
+}
+
+ensure_telegram_optional() {
+  if [[ -z "${TG_BOT}" || -z "${TG_WEBHOOK_ID}" || -z "${TG_SECRET}" ]]; then
+    echo "=== Telegram: пропущено (токен/webhook не заданы) — demo-only режим ==="
+    return 0
+  fi
+  ensure_telegram
 }
 
 # После рестарта n8n перезаписывает webhook — вызывать ensure после up/restart
@@ -57,7 +67,7 @@ post_n8n_start() {
   # WF-05 inactive, но n8n может оставить старый TG webhook — убираем
   pg_n8n() { docker exec sales-flow-postgres psql -U salesflow -d n8n -c "$1"; }
   pg_n8n "DELETE FROM webhook_entity WHERE \"workflowId\" = 'SRzWwdEzXlziXTrf';" >/dev/null || true
-  ensure_telegram
+  ensure_telegram_optional
 }
 
 pg() {
@@ -185,10 +195,14 @@ UPDATE training_sessions SET
 WHERE session_id = '${SESSION_ID}'::uuid;
 UPDATE dialogs SET status = 'coaching', updated_at = NOW() WHERE dialog_id = '${DIALOG}'::uuid;
 "
-  curl -s -X POST "https://api.telegram.org/bot${TG_BOT}/sendMessage" \
-    -H "Content-Type: application/json" \
-    -d "{\"chat_id\":${CHAT_ID},\"text\":\"${MSG}\"}"
-  echo
+  if [[ -n "${TG_BOT}" ]]; then
+    curl -s -X POST "https://api.telegram.org/bot${TG_BOT}/sendMessage" \
+      -H "Content-Type: application/json" \
+      -d "{\"chat_id\":${CHAT_ID},\"text\":\"${MSG}\"}"
+    echo
+  else
+    echo ">>> Telegram skipped (no TELEGRAM_BOT_TOKEN)"
+  fi
   echo ">>> Сессия завершена. Дальше: ./scripts/demo.sh wf07"
   pg "SELECT session_id, state, ended_at IS NOT NULL AS done FROM training_sessions WHERE session_id = '${SESSION_ID}'::uuid;"
 }
@@ -220,10 +234,10 @@ curl-all() {
 }
 
 manual() {
-  ensure_telegram
+  ensure_telegram_optional
   reset
   curl-all
-  ensure_telegram
+  ensure_telegram_optional
   cat <<'EOF'
 
 === MANUAL DEMO — дальше вручную (для видео) ===
@@ -241,7 +255,7 @@ EOF
 }
 
 auto() {
-  ensure_telegram
+  ensure_telegram_optional
   reset
   curl-all
   wf05

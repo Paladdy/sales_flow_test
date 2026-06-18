@@ -1,0 +1,324 @@
+{
+  "name": "WF-05 Training Gate",
+  "nodes": [
+    {
+      "parameters": {
+        "updates": [
+          "callback_query"
+        ],
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -224,
+        -16
+      ],
+      "id": "5b56373d-3f48-4962-b69e-a753252755dc",
+      "name": "TG Callback",
+      "webhookId": "8fe7128d-56d5-4f99-9579-777d67d235f7",
+      "credentials": {
+        "telegramApi": {
+          "id": "__TELEGRAM_CRED_ID__",
+          "name": "Telegram Bot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const cb = $input.first().json.callback_query?.data ?? '';\nconst [action, action_token] = cb.split(':');\n\nreturn [{\n  json: {\n    action,\n    action_token,\n    callback_query_id: $input.first().json.callback_query.id,\n  },\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -16,
+        -16
+      ],
+      "id": "98734140-ed81-472b-b83d-29c935ba20cd",
+      "name": "Parse Callback"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "b9577327-6328-4c0e-b335-c2085dc43c14",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "train",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        640,
+        0
+      ],
+      "id": "953d114a-3c5a-43eb-a9be-e8e813383640",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT p.action_token, p.dialog_id, d.employee_id, d.status\nFROM pending_training_actions p\nJOIN dialogs d ON d.dialog_id = p.dialog_id\nWHERE p.action_token = '{{ $json.action_token }}'::uuid\n  AND p.used_at IS NULL\n  AND p.expires_at > NOW()\n  AND d.status = 'awaiting_training_confirm';",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        192,
+        -16
+      ],
+      "id": "8d384268-4610-4405-bf1b-e40dc67ecf15",
+      "name": "PG Validate",
+      "credentials": {
+        "postgres": {
+          "id": "__POSTGRES_CRED_ID__",
+          "name": "Sales Flow Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE pending_training_actions\nSET used_at = NOW()\nWHERE action_token = '{{ $('Parse Callback').first().json.action_token }}'::uuid;\n\nUPDATE dialogs\nSET status = 'training_skipped', updated_at = NOW()\nWHERE dialog_id = '{{ $json.dialog_id }}'::uuid\nRETURNING dialog_id, status;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        848,
+        96
+      ],
+      "id": "40080de9-0d0a-41a5-823c-3f5af8a1eaf2",
+      "name": "PG SKIP",
+      "credentials": {
+        "postgres": {
+          "id": "__POSTGRES_CRED_ID__",
+          "name": "Sales Flow Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE pending_training_actions\nSET used_at = NOW()\nWHERE action_token = '{{ $('Parse Callback').first().json.action_token }}'::uuid;\n\nUPDATE dialogs\nSET status = 'training_approved', updated_at = NOW()\nWHERE dialog_id = '{{ $json.dialog_id }}'::uuid\nRETURNING dialog_id, status, employee_id;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        912,
+        -112
+      ],
+      "id": "9c311dde-b097-451c-a65b-a777436e5609",
+      "name": "PG Approve",
+      "credentials": {
+        "postgres": {
+          "id": "__POSTGRES_CRED_ID__",
+          "name": "Sales Flow Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.N8N_WEBHOOK_BASE || 'http://localhost:5678/webhook/' }}start-coach",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ dialog_id: $json.dialog_id, employee_id: $json.employee_id }) }}",
+        "options": {
+          "timeout": 30000,
+          "retry": {
+            "maxTries": 5,
+            "waitBetweenTries": 2000
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        1120,
+        -112
+      ],
+      "id": "06ed5769-e46b-4879-8bc0-f78bcc36061a",
+      "name": "HTTP Start Coach"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://api.telegram.org/bot' + $env.TELEGRAM_BOT_TOKEN + '/answerCallbackQuery' }}",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "{{ JSON.stringify({ callback_query_id: $('Parse Callback').first().json.callback_query_id, text: 'Отложено' }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        1056,
+        96
+      ],
+      "id": "7fe2db42-b572-4ce7-a572-01d69c9d9132",
+      "name": "TG Answer Skip"
+    },
+    {
+      "parameters": {
+        "jsCode": "const parse = $('Parse Callback').first().json;\nconst v = $input.first().json;\n\nreturn [{\n  json: {\n    ...v,\n    action: parse.action,\n    action_token: parse.action_token,\n    callback_query_id: parse.callback_query_id,\n  },\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        464,
+        0
+      ],
+      "id": "312180cf-8b75-400a-be3c-18fb8e84439f",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://api.telegram.org/bot' + $env.TELEGRAM_BOT_TOKEN + '/answerCallbackQuery' }}",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ callback_query_id: $('Parse Callback').first().json.callback_query_id, text: 'Тренировка запущена' }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        1280,
+        -112
+      ],
+      "id": "30c2e915-4866-4060-bc3e-b70c8b9e2322",
+      "name": "TG Answer Approve"
+    }
+  ],
+  "connections": {
+    "Parse Callback": {
+      "main": [
+        [
+          {
+            "node": "PG Validate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG Validate": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "PG Approve",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "PG SKIP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG Approve": {
+      "main": [
+        [
+          {
+            "node": "HTTP Start Coach",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG SKIP": {
+      "main": [
+        [
+          {
+            "node": "TG Answer Skip",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "TG Callback": {
+      "main": [
+        [
+          {
+            "node": "Parse Callback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Start Coach": {
+      "main": [
+        [
+          {
+            "node": "TG Answer Approve",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "nodeGroups": [],
+  "tags": [
+    {
+      "name": "sales-flow"
+    }
+  ],
+  "active": false,
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}
